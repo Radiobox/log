@@ -9,7 +9,7 @@ import (
 )
 
 type BufferedKinesisWriter struct {
-	messages   chan string
+	messages   chan []byte
 	client     *kinesis.Kinesis
 	streamName string
 	flushLock *sync.Mutex
@@ -18,15 +18,31 @@ type BufferedKinesisWriter struct {
 func NewBufferedKinesisWriter(accessKey, secretKey, streamName string, buffer int) *BufferedKinesisWriter {
 	writer := new(BufferedKinesisWriter)
 	writer.client = kinesis.New(accessKey, secretKey)
-	writer.messages = make(chan string, buffer)
+	writer.messages = make(chan []byte, buffer)
 	writer.streamName = streamName
 	writer.flushLock = new(sync.Mutex)
 	return writer
 }
 
 // send sends a data blob to Kinesis.
-func (writer *BufferedKinesisWriter) send(message string) error {
-	// _, err := writer.client.PutRecord()
+func (writer *BufferedKinesisWriter) send(message []byte) (err error) {
+	if message != nil {
+		args := kinesis.NewArgs()
+		args.Add("PartitionKey", "test")
+		args.Add("StreamName", writer.streamName)
+		args.Add("Data", message)
+		_, err = writer.client.PutRecord(args)
+	}
+	return
+}
+
+func (writer *BufferedKinesisWriter) sendAll(messages [][]byte) (err error) {
+	for _, message := range messages {
+		err = writer.send(message)
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -36,19 +52,16 @@ func (writer *BufferedKinesisWriter) Flush() error {
 	// First, get the messages off of the buffer, so that we don't tie
 	// up other processes too long
 	writer.flushLock.Lock()
-	var (
-		bufferedMessages = make([]string, len(writer.messages))
-	)
+	bufferedMessages := make([][]byte, len(writer.messages))
 	for i := 0; i < len(writer.messages); i++ {
 		bufferedMessages[i] = <-writer.messages
 	}
 	writer.flushLock.Unlock()
 
 	// Now, send all the buffered messages
-	for _, message := range bufferedMessages {
-		if err := writer.send(message); err != nil {
-			return err
-		}
+	if err := writer.sendAll(bufferedMessages); err != nil {
+		log.Panic("Could not write to kinesis: " + err.Error())
+		return err
 	}
 	return nil
 }
@@ -65,10 +78,10 @@ func (writer *BufferedKinesisWriter) Write(data []byte) (int, error) {
 
 func (writer *BufferedKinesisWriter) write(data []byte, recurse bool) (int, error) {
 	if cap(writer.messages) == 0 {
-		return len(data), writer.send(string(data))
+		return len(data), writer.send(data)
 	}
 	select {
-	case writer.messages <- string(data):
+	case writer.messages <- data:
 	default:
 		go writer.Flush()
 
@@ -76,7 +89,7 @@ func (writer *BufferedKinesisWriter) write(data []byte, recurse bool) (int, erro
 		// long.  If the request times out, try one recursive call
 		// before giving up.
 		select {
-		case writer.messages <- string(data):
+		case writer.messages <- data:
 		case <-time.After(50 * time.Millisecond):
 			if recurse {
 				return writer.write(data, false)
@@ -88,8 +101,8 @@ func (writer *BufferedKinesisWriter) write(data []byte, recurse bool) (int, erro
 }
 
 func (writer *BufferedKinesisWriter) Close() error {
-	err := writer.Flush()
 	close(writer.messages)
+	err := writer.Flush()
 	return err
 }
 
